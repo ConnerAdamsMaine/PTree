@@ -122,6 +122,10 @@ pub struct Args {
     /// Enable debug output with timing and performance metrics
     #[arg(long)]
     pub debug: bool,
+
+    /// Show skip statistics (directories skipped during traversal)
+    #[arg(long)]
+    pub skip_stats: bool,
 }
 
 pub fn parse_args() -> Args {

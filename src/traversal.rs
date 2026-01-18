@@ -9,6 +9,9 @@ use chrono::Utc;
 use parking_lot::RwLock;
 use anyhow::Result;
 
+#[cfg(windows)]
+use crate::usn_journal::USNTracker;
+
 /// Debug timing information
 #[derive(Debug, Clone)]
 pub struct DebugInfo {
@@ -17,6 +20,7 @@ pub struct DebugInfo {
     pub cache_used: bool,
     pub traversal_time: Duration,
     pub save_time: Duration,
+    pub cache_index_time: Duration,
     pub total_dirs: usize,
     pub threads_used: usize,
 }
@@ -34,59 +38,160 @@ pub struct TraversalState {
 
     /// Directories to skip during traversal
     pub skip_dirs: std::collections::HashSet<String>,
+    
+    /// Directories that changed since last scan (for incremental updates)
+    /// If set, only these directories will be rescanned; unset means full scan
+    pub changed_dirs_filter: Option<std::collections::HashSet<String>>,
+
+    /// Skip statistics: count of skipped directories (shared across threads)
+    pub skip_stats: Arc<Mutex<std::collections::HashMap<String, usize>>>,
 }
 
-/// Traverse disk and update cache
+/// Traverse disk and update cache (per README spec)
+///
+/// Cache Correctness Model:
+/// - First scan: Produces accurate snapshot of filesystem at scan time
+/// - After scan, before USN refresh: Cache may lag live filesystem changes (eventual consistency)
+/// - After 1-hour interval: USN Journal refresh synchronizes cache to current state
+/// - Cache invariant: Always correct given sufficient time (1-hour refresh window)
+///
+/// USN Journal Management:
+/// - Max size: 500MB (hardcoded)
+/// - On wrap-around: Cache is increased up to 500MB limit
+/// - If 500MB capacity is reached and wrap occurs: Automatic fallback to full rescan
+/// - USN entries are cached; refresh interval is 1 hour from last cache write
 ///
 /// Returns DebugInfo with timing information if --debug is enabled
 ///
 /// Algorithm:
 /// 1. On first run: Full scan of specified drive and cache results
-/// 2. On subsequent runs: Only scan current directory (where command is run)
-/// 3. Check cache freshness (< 1 hour). If fresh and not forced, return early.
-/// 4. Initialize work queue with target directory
-/// 5. Spawn worker threads that process queue in parallel (DFS)
-/// 6. Flush all pending writes and save cache atomically
+/// 2. On subsequent runs: Check cache age and USN Journal
+/// 3. If cache < 1 hour old: Use cache (instant return)
+/// 4. If cache >= 1 hour old: Check USN Journal for wrap-around
+/// 5. If wrap-around detected: Full rescan of specified drive
+/// 6. Initialize work queue with drive root
+/// 7. Spawn worker threads that process queue in parallel (iterative DFS)
+/// 8. Flush all pending writes and save cache atomically
 pub fn traverse_disk(drive: &char, cache: &mut DiskCache, args: &Args) -> Result<DebugInfo> {
-    // Get the current working directory
-    let current_dir = std::env::current_dir()?;
-
-    // Determine scan root: full drive on first run, current dir on subsequent runs
-    let is_first_run = cache.entries.is_empty();
-    let scan_root = if is_first_run {
-        // First run: scan the specified drive
+    // Determine scan root: current directory by default, full drive with --force
+    let scan_root = if args.force {
+        // --force: scan full drive
         let root = PathBuf::from(format!("{}:\\", drive));
         if !root.exists() {
             anyhow::bail!("Drive {} does not exist", drive);
         }
         root
     } else {
-        // Subsequent runs: scan only the current directory
-        current_dir.clone()
+        // Default: scan current directory and subdirectories
+        std::env::current_dir()?
     };
+    
+    // Verify scan root exists and is a directory
+    if !scan_root.exists() {
+        anyhow::bail!("Scan root does not exist: {}", scan_root.display());
+    }
+    if !scan_root.is_dir() {
+        anyhow::bail!("Scan root is not a directory: {}", scan_root.display());
+    }
 
+    let is_first_run = cache.entries.is_empty();
     cache.root = scan_root.clone();
-    cache.last_scanned_root = scan_root.clone();
 
     // ============================================================================
-    // Check Cache Freshness
+    // Check Cache Freshness (1-hour rule from README)
     // ============================================================================
 
-    if !args.force {
+    let should_use_cache = if args.force {
+        false // --force always triggers rescan
+    } else if is_first_run {
+        false // First run always scans
+    } else {
+        // Check 1-hour freshness rule
         let now = Utc::now();
         let age = now.signed_duration_since(cache.last_scan);
-        if age.num_seconds() < 3600 && !cache.entries.is_empty() {
-            return Ok(DebugInfo {
-                is_first_run: false,
-                scan_root: cache.root.clone(),
-                cache_used: true,
-                traversal_time: Duration::from_secs(0),
-                save_time: Duration::from_secs(0),
-                total_dirs: cache.entries.len(),
-                threads_used: 0,
-            });
+        
+        // Also check USN Journal for wrap-around on Windows
+        #[cfg(windows)]
+        {
+            let mut tracker = USNTracker::new(scan_root.clone(), cache.usn_state.clone());
+            if tracker.needs_refresh() {
+                // Check for wrap-around condition
+                if let Ok((changed_dirs, wrap_detected, new_state)) = tracker.refresh() {
+                    cache.usn_state = new_state; // Update state regardless
+                    if wrap_detected {
+                        // Wrap-around detected: must do full rescan
+                        false
+                    } else if changed_dirs.is_empty() {
+                        // No changes detected: use cache
+                        age.num_seconds() < 3600
+                    } else {
+                        // Changes detected: trigger full rescan to update affected directories
+                        // (Targeted rescan would require FRN->path lookup in MFT; full rescan is safer)
+                        false
+                    }
+                } else {
+                    // USN query failed: fall back to time-based check
+                    age.num_seconds() < 3600
+                }
+            } else {
+                // Cache is fresh per 1-hour rule: use it
+                age.num_seconds() < 3600
+            }
         }
+        
+        #[cfg(not(windows))]
+        {
+            // Non-Windows: just use time-based rule
+            age.num_seconds() < 3600
+        }
+    };
+    
+    if should_use_cache {
+        return Ok(DebugInfo {
+            is_first_run: false,
+            scan_root: cache.root.clone(),
+            cache_used: true,
+            traversal_time: Duration::from_secs(0),
+            save_time: Duration::from_secs(0),
+            cache_index_time: Duration::from_secs(0),
+            total_dirs: cache.entries.len(),
+            threads_used: 0,
+        });
     }
+
+    // ============================================================================
+    // Prepare for Traversal (check for incremental update opportunity)
+    // ============================================================================
+    
+    #[cfg(windows)]
+    let changed_dirs_filter = {
+        // Check if we have changed directories from USN Journal
+        if !cache.entries.is_empty() {
+            let mut tracker = USNTracker::new(scan_root.clone(), cache.usn_state.clone());
+            if tracker.needs_refresh() {
+                if let Ok((changed_dirs, wrap_detected, new_state)) = tracker.refresh() {
+                    cache.usn_state = new_state;
+                    if !wrap_detected && !changed_dirs.is_empty() {
+                        // Convert PathBuf changed_dirs to HashSet<String> for filtering
+                        Some(changed_dirs.iter()
+                            .filter_map(|p| p.to_str().map(|s| s.to_string()))
+                            .collect())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    
+    #[cfg(not(windows))]
+    let changed_dirs_filter: Option<std::collections::HashSet<String>> = None;
 
     // ============================================================================
     // Initialize Traversal State
@@ -100,6 +205,8 @@ pub fn traverse_disk(drive: &char, cache: &mut DiskCache, args: &Args) -> Result
         cache: Arc::new(RwLock::new(cache.clone())),
         in_progress: Arc::new(Mutex::new(std::collections::HashSet::new())),
         skip_dirs: args.skip_dirs(),
+        changed_dirs_filter,
+        skip_stats: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
     // ============================================================================
@@ -117,15 +224,21 @@ pub fn traverse_disk(drive: &char, cache: &mut DiskCache, args: &Args) -> Result
     // ============================================================================
 
     let traversal_start = Instant::now();
+    let filter = state.changed_dirs_filter.clone();
+    let root = scan_root.clone();
+    let skip_stats_ref = Arc::clone(&state.skip_stats);
     pool.in_place_scope(|s| {
         for _ in 0..num_threads {
             let work = Arc::clone(&state.work_queue);
             let cache_ref = Arc::clone(&state.cache);
             let skip = state.skip_dirs.clone();
             let in_progress = Arc::clone(&state.in_progress);
+            let filter_ref = filter.clone();
+            let root_ref = root.clone();
+            let stats_ref = Arc::clone(&skip_stats_ref);
 
             s.spawn(move |_| {
-                dfs_worker(&work, &cache_ref, &skip, &in_progress);
+                dfs_worker(&work, &cache_ref, &skip, &in_progress, &filter_ref, &root_ref, &stats_ref);
             });
         }
     });
@@ -143,13 +256,27 @@ pub fn traverse_disk(drive: &char, cache: &mut DiskCache, args: &Args) -> Result
         }
     };
 
+    let cache_index_start = Instant::now();
+    
     *cache = final_cache;
     cache.last_scan = Utc::now();
+
+    // Transfer skip statistics from traversal state to cache
+    let skip_stats = match Arc::try_unwrap(state.skip_stats) {
+        Ok(lock) => lock.into_inner().unwrap_or_default(),
+        Err(arc) => {
+            let guard = arc.lock().unwrap();
+            guard.clone()
+        }
+    };
+    cache.skip_stats = skip_stats;
 
     let cache_path = crate::cache::get_cache_path()?;
     let save_start = Instant::now();
     cache.save(&cache_path)?;
     let save_elapsed = save_start.elapsed();
+    
+    let cache_index_elapsed = cache_index_start.elapsed();
 
     // ============================================================================
     // Return Debug Info
@@ -161,6 +288,7 @@ pub fn traverse_disk(drive: &char, cache: &mut DiskCache, args: &Args) -> Result
         cache_used: false,
         traversal_time: traversal_elapsed,
         save_time: save_elapsed,
+        cache_index_time: cache_index_elapsed,
         total_dirs: cache.entries.len(),
         threads_used: num_threads,
     })
@@ -172,12 +300,16 @@ pub fn traverse_disk(drive: &char, cache: &mut DiskCache, args: &Args) -> Result
 /// 1. Pulls directories from shared work queue
 /// 2. Acquires per-directory lock to prevent duplicate processing
 /// 3. Enumerates directory, filters skipped entries
-/// 4. Buffers children in cache and queues directories for processing
+/// 4. For incremental updates: only process directories in changed_dirs_filter
+/// 5. Buffers children in cache and queues directories for processing
 fn dfs_worker(
     work_queue: &Arc<Mutex<VecDeque<PathBuf>>>,
     cache: &Arc<RwLock<DiskCache>>,
     skip_dirs: &std::collections::HashSet<String>,
     in_progress: &Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    changed_dirs_filter: &Option<std::collections::HashSet<String>>,
+    scan_root: &PathBuf,
+    skip_stats: &Arc<Mutex<std::collections::HashMap<String, usize>>>,
 ) {
     loop {
         // ====================================================================
@@ -206,75 +338,146 @@ fn dfs_worker(
 
             if acquired {
                 // ============================================================
-                // Enumerate Directory & Process Entries
+                // Check Incremental Filter (if applicable)
                 // ============================================================
+                
+                let should_process = if let Some(filter) = changed_dirs_filter {
+                    // Incremental mode: only process if this directory changed
+                    let dir_name = path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("");
+                    filter.contains(dir_name) || path == *scan_root
+                } else {
+                    // Full scan mode: process all directories
+                    true
+                };
+                
+                if should_process {
+                    // ============================================================
+                    // Enumerate Directory & Process Entries
+                    // ============================================================
 
-                if let Ok(entries) = fs::read_dir(&path) {
-                    let mut children = Vec::new();
+                    if let Ok(entries) = fs::read_dir(&path) {
+                         let mut children = Vec::new();
+                         let mut child_entries = Vec::new();
+                         let mut child_dirs = Vec::new();
+                         let mut skipped = Vec::new(); // Batch skipped directories
 
-                    for entry_result in entries {
-                        if let Ok(entry) = entry_result {
-                            let file_name = entry.file_name();
-                            let file_name_str = file_name.to_string_lossy();
+                         for entry_result in entries {
+                              if let Ok(entry) = entry_result {
+                                  let file_name = entry.file_name();
+                                  let file_name_str = file_name.to_string_lossy();
 
-                            // Skip filtered directories
-                            if should_skip(&file_name_str, skip_dirs) {
-                                continue;
-                            }
+                                  // Skip filtered directories
+                                  if should_skip(&file_name_str, skip_dirs) {
+                                      // Batch skip statistics (don't lock on every skip)
+                                      skipped.push(file_name_str.to_string());
+                                      continue;
+                                  }
 
-                            let child_path = entry.path();
-                            children.push(file_name_str.to_string());
+                                 let child_path = entry.path();
+                                 children.push(file_name_str.to_string());
 
-                            // Queue directories for processing (avoid symlinks)
-                            if let Ok(metadata) = entry.metadata() {
-                                if metadata.is_dir() && !metadata.is_symlink() {
-                                    let mut queue = work_queue.lock().unwrap();
-                                    queue.push_back(child_path);
-                                }
-                            }
-                        }
+                                 // Check if this is a directory (avoid unnecessary metadata calls for files)
+                                 match entry.file_type() {
+                                     Ok(ft) if ft.is_symlink() => {
+                                         // Capture symlink target
+                                         let target = fs::read_link(&child_path).ok();
+                                         child_entries.push((file_name_str.to_string(), target));
+                                     }
+                                     Ok(ft) if ft.is_dir() => {
+                                         // Queue directories for processing (non-symlink)
+                                         child_dirs.push(child_path);
+                                     }
+                                     _ => {} // Not a directory, skip
+                                 }
+                             }
+                         }
+
+                         // ========================================================
+                         // Batch queue directories (reduce lock contention)
+                         // ========================================================
+                         if !child_dirs.is_empty() {
+                             let mut queue = work_queue.lock().unwrap();
+                             for dir_path in child_dirs {
+                                 queue.push_back(dir_path);
+                             }
+                         }
+
+                         // ========================================================
+                         // Batch flush skip statistics (reduce lock contention)
+                         // ========================================================
+                         if !skipped.is_empty() {
+                             let mut stats = skip_stats.lock().unwrap();
+                             for skip_name in skipped {
+                                 *stats.entry(skip_name).or_insert(0) += 1;
+                             }
+                         }
+
+                         // ========================================================
+                         // Skip sorting during traversal (defer to output phase)
+                         // Children list stored unsorted for now
+                         // ========================================================
+
+                         // Check if directory has hidden attribute (Windows only)
+                         let is_hidden = {
+                             #[cfg(windows)]
+                             {
+                                 use std::os::windows::fs::MetadataExt;
+                                 fs::metadata(&path)
+                                     .map(|m| {
+                                         const FILE_ATTRIBUTE_HIDDEN: u32 = 0x02;
+                                         (m.file_attributes() & FILE_ATTRIBUTE_HIDDEN) != 0
+                                     })
+                                     .unwrap_or(false)
+                             }
+                             #[cfg(not(windows))]
+                             {
+                                 // Unix-like: check if name starts with dot
+                                 path.file_name()
+                                     .and_then(|n| n.to_str())
+                                     .map(|s| s.starts_with('.'))
+                                     .unwrap_or(false)
+                             }
+                         };
+
+                         let dir_entry = DirEntry {
+                             path: path.clone(),
+                             name: path
+                                 .file_name()
+                                 .and_then(|n| n.to_str().map(|s| s.to_string()))
+                                 .unwrap_or_default(),
+                             modified: Utc::now(),
+                             size: 0,
+                             children, // Unsorted for now - sorted at output time
+                             symlink_target: None, // Directories themselves are not symlinks
+                             is_hidden,
+                         };
+
+                         // ========================================================
+                         // Buffer entry in cache with automatic batching
+                         // Flush happens automatically when threshold is reached
+                         // ========================================================
+                         {
+                             let mut cache_guard = cache.write();
+                             cache_guard.add_entry(path.clone(), dir_entry);
+                         } // Lock released immediately
                     }
 
-                    // ========================================================
-                    // Sort Children (parallel for large directories)
-                    // ========================================================
+                    // ============================================================
+                    // Release Per-Directory Lock
+                    // ============================================================
 
-                    let sorted_children = if children.len() > 100 {
-                        use rayon::slice::ParallelSliceMut;
-                        let mut child_copy = children;
-                        child_copy.par_sort();
-                        child_copy
-                    } else {
-                        children.sort();
-                        children
-                    };
-
-                    // ========================================================
-                    // Buffer Directory Entry to Cache
-                    // ========================================================
-
-                    let dir_entry = DirEntry {
-                        path: path.clone(),
-                        name: path
-                            .file_name()
-                            .and_then(|n| n.to_str().map(|s| s.to_string()))
-                            .unwrap_or_default(),
-                        modified: Utc::now(),
-                        size: 0,
-                        children: sorted_children,
-                    };
-
-                    let mut cache_guard = cache.write();
-                    cache_guard.add_entry(path.clone(), dir_entry);
-                }
-
-                // ============================================================
-                // Release Per-Directory Lock
-                // ============================================================
-
-                {
-                    let mut progress = in_progress.lock().unwrap();
-                    progress.remove(&path);
+                    {
+                        let mut progress = in_progress.lock().unwrap();
+                        progress.remove(&path);
+                    }
+                } else {
+                    // Directory filtered out (incremental mode): skip it
+                    {
+                        let mut progress = in_progress.lock().unwrap();
+                        progress.remove(&path);
+                    }
                 }
             }
         } else {

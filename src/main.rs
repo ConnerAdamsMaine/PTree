@@ -1,4 +1,5 @@
 mod cache;
+mod cache_mmap;
 mod traversal;
 mod error;
 mod cli;
@@ -34,7 +35,9 @@ fn main() -> Result<()> {
     // ========================================================================
 
     let cache_path = cache::get_cache_path()?;
+    let cache_load_start = Instant::now();
     let mut cache = cache::DiskCache::open(&cache_path)?;
+    let cache_load_elapsed = cache_load_start.elapsed();
 
     // ========================================================================
     // Traverse Disk & Update Cache
@@ -46,21 +49,38 @@ fn main() -> Result<()> {
     // Output Results
     // ========================================================================
 
-    let output_start = Instant::now();
-    if !args.quiet {
-        let output = match args.format {
+    cache.show_hidden = args.hidden;
+
+    let formatting_start = Instant::now();
+    let output = if !args.quiet {
+        Some(match args.format {
             OutputFormat::Tree => {
                 if use_colors {
-                    cache.build_colored_tree_output()?
+                    cache.build_colored_tree_output_with_depth(args.max_depth)?
                 } else {
-                    cache.build_tree_output()?
+                    cache.build_tree_output_with_depth(args.max_depth)?
                 }
             }
-            OutputFormat::Json => cache.build_json_output()?,
-        };
+            OutputFormat::Json => cache.build_json_output_with_depth(args.max_depth)?,
+        })
+    } else {
+        None
+    };
+    let formatting_elapsed = formatting_start.elapsed();
+    
+    let output_start = Instant::now();
+    if let Some(output) = output {
         println!("{}", output);
     }
     let output_elapsed = output_start.elapsed();
+
+    // ========================================================================
+    // Skip Statistics (if requested)
+    // ========================================================================
+
+    if args.skip_stats {
+        eprintln!("{}", cache.get_skip_report());
+    }
 
     // ========================================================================
     // Debug Output (Final Summary)
@@ -68,15 +88,24 @@ fn main() -> Result<()> {
 
     if args.debug {
         let total_elapsed = program_start.elapsed();
-        print_debug_summary(&debug_info, output_elapsed, &cache_path, total_elapsed);
+        print_debug_summary(&debug_info, cache_load_elapsed, formatting_elapsed, output_elapsed, &cache_path, total_elapsed);
     }
 
     Ok(())
 }
 
+/// Format duration in both milliseconds and microseconds
+fn format_duration(duration: std::time::Duration) -> String {
+    let ms = duration.as_secs_f64() * 1000.0;
+    let us = duration.as_secs_f64() * 1_000_000.0;
+    format!("{:.3} MS | {:.3} US", ms, us)
+}
+
 /// Print formatted debug summary
 fn print_debug_summary(
     debug_info: &traversal::DebugInfo,
+    cache_load_time: std::time::Duration,
+    formatting_time: std::time::Duration,
     output_time: std::time::Duration,
     cache_path: &std::path::Path,
     total_time: std::time::Duration,
@@ -91,12 +120,15 @@ fn print_debug_summary(
     eprintln!("\n{:<40} {}", "Directories Scanned:", format_number(debug_info.total_dirs));
     eprintln!("{:<40} {}", "Threads Used:", debug_info.threads_used);
 
+    eprintln!("\n{:<40} {}", "Cache Load Time:", format_duration(cache_load_time));
     if !debug_info.cache_used {
-        eprintln!("\n{:<40} {:.3}s", "Traversal Time:", debug_info.traversal_time.as_secs_f64());
-        eprintln!("{:<40} {:.3}s", "Cache Save Time:", debug_info.save_time.as_secs_f64());
+        eprintln!("{:<40} {}", "Traversal Time:", format_duration(debug_info.traversal_time));
+        eprintln!("{:<40} {}", "Cache Index Time:", format_duration(debug_info.cache_index_time));
+        eprintln!("{:<40} {}", "Cache Save Time:", format_duration(debug_info.save_time));
     }
-    eprintln!("{:<40} {:.3}s", "Output Formatting Time:", output_time.as_secs_f64());
-    eprintln!("{:<40} {:.3}s", "Total Time:", total_time.as_secs_f64());
+    eprintln!("{:<40} {}", "Formatting Time:", format_duration(formatting_time));
+    eprintln!("{:<40} {}", "Output Time:", format_duration(output_time));
+    eprintln!("{:<40} {}", "Total Time:", format_duration(total_time));
 
     eprintln!("\n{:<40} {}", "Cache Location:", cache_path.display());
     eprintln!("{}", "=".repeat(70));
