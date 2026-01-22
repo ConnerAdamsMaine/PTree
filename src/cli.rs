@@ -72,6 +72,22 @@ pub struct Args {
     pub force: bool,
 
     // ========================================================================
+    // Cache Options
+    // ========================================================================
+
+    /// Cache time-to-live in seconds (default: 3600)
+    #[arg(long)]
+    pub cache_ttl: Option<u64>,
+
+    /// Override cache directory location
+    #[arg(long)]
+    pub cache_dir: Option<String>,
+
+    /// Disable cache entirely (scan fresh every time)
+    #[arg(long)]
+    pub no_cache: bool,
+
+    // ========================================================================
     // Output & Display Options
     // ========================================================================
 
@@ -86,6 +102,18 @@ pub struct Args {
     /// Color output: auto, always, never
     #[arg(long, default_value = "auto")]
     pub color: ColorMode,
+
+    /// Include directory sizes in output
+    #[arg(long)]
+    pub size: bool,
+
+    /// Include file count per directory
+    #[arg(long)]
+    pub file_count: bool,
+
+    /// Display summary statistics (total dirs, scan time, cache info)
+    #[arg(long)]
+    pub stats: bool,
 
     // ========================================================================
     // Filtering & Traversal Options
@@ -124,13 +152,29 @@ pub struct Args {
     pub debug: bool,
 
     /// Show skip statistics (directories skipped during traversal)
-    #[arg(long)]
-    pub skip_stats: bool,
-}
-
-pub fn parse_args() -> Args {
-    Args::parse()
-}
+     #[arg(long)]
+     pub skip_stats: bool,
+    
+     // ========================================================================
+     // Scheduler Options
+     // ========================================================================
+    
+     /// Setup automatic cache refresh every 30 minutes (Windows Task Scheduler / cron)
+     #[arg(long)]
+     pub scheduler: bool,
+    
+     /// Remove scheduled cache updates
+     #[arg(long)]
+     pub scheduler_uninstall: bool,
+    
+     /// Show scheduler status
+     #[arg(long)]
+     pub scheduler_status: bool,
+    }
+    
+    pub fn parse_args() -> Args {
+     Args::parse()
+    }
 
 impl Args {
     /// Build skip directory set based on arguments

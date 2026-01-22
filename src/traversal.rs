@@ -9,10 +9,9 @@ use chrono::Utc;
 use parking_lot::RwLock;
 use anyhow::Result;
 
-#[cfg(windows)]
-use crate::usn_journal::USNTracker;
 
-/// Debug timing information
+
+/// Debug timing information and statistics
 #[derive(Debug, Clone)]
 pub struct DebugInfo {
     pub is_first_run: bool,
@@ -22,6 +21,7 @@ pub struct DebugInfo {
     pub save_time: Duration,
     pub cache_index_time: Duration,
     pub total_dirs: usize,
+    pub total_files: usize,
     pub threads_used: usize,
 }
 
@@ -97,56 +97,44 @@ pub fn traverse_disk(drive: &char, cache: &mut DiskCache, args: &Args) -> Result
     let is_first_run = cache.entries.is_empty();
     cache.root = scan_root.clone();
 
+    // Ensure root directory is added to cache (important for --no-cache mode)
+    if is_first_run && !cache.entries.contains_key(&scan_root) {
+        let root_entry = DirEntry {
+            path: scan_root.clone(),
+            name: scan_root
+                .file_name()
+                .and_then(|n| n.to_str().map(|s| s.to_string()))
+                .unwrap_or_default(),
+            modified: Utc::now(),
+            size: 0,
+            children: Vec::new(),
+            symlink_target: None,
+            is_hidden: false,
+        };
+        cache.entries.insert(scan_root.clone(), root_entry);
+    }
+
     // ============================================================================
-    // Check Cache Freshness (1-hour rule from README)
+    // Check Cache Freshness (configurable via --cache-ttl, default 1 hour)
     // ============================================================================
 
-    let should_use_cache = if args.force {
+    let cache_ttl_seconds = args.cache_ttl.unwrap_or(3600);
+    
+    let should_use_cache = if args.no_cache {
+        false // --no-cache always triggers rescan
+    } else if args.force {
         false // --force always triggers rescan
     } else if is_first_run {
         false // First run always scans
     } else {
-        // Check 1-hour freshness rule
+        // Check cache freshness rule (time-based only)
         let now = Utc::now();
         let age = now.signed_duration_since(cache.last_scan);
-        
-        // Also check USN Journal for wrap-around on Windows
-        #[cfg(windows)]
-        {
-            let mut tracker = USNTracker::new(scan_root.clone(), cache.usn_state.clone());
-            if tracker.needs_refresh() {
-                // Check for wrap-around condition
-                if let Ok((changed_dirs, wrap_detected, new_state)) = tracker.refresh() {
-                    cache.usn_state = new_state; // Update state regardless
-                    if wrap_detected {
-                        // Wrap-around detected: must do full rescan
-                        false
-                    } else if changed_dirs.is_empty() {
-                        // No changes detected: use cache
-                        age.num_seconds() < 3600
-                    } else {
-                        // Changes detected: trigger full rescan to update affected directories
-                        // (Targeted rescan would require FRN->path lookup in MFT; full rescan is safer)
-                        false
-                    }
-                } else {
-                    // USN query failed: fall back to time-based check
-                    age.num_seconds() < 3600
-                }
-            } else {
-                // Cache is fresh per 1-hour rule: use it
-                age.num_seconds() < 3600
-            }
-        }
-        
-        #[cfg(not(windows))]
-        {
-            // Non-Windows: just use time-based rule
-            age.num_seconds() < 3600
-        }
+        age.num_seconds() < cache_ttl_seconds as i64
     };
     
     if should_use_cache {
+        let total_files = cache.entries.values().map(|e| e.children.len()).sum();
         return Ok(DebugInfo {
             is_first_run: false,
             scan_root: cache.root.clone(),
@@ -155,42 +143,17 @@ pub fn traverse_disk(drive: &char, cache: &mut DiskCache, args: &Args) -> Result
             save_time: Duration::from_secs(0),
             cache_index_time: Duration::from_secs(0),
             total_dirs: cache.entries.len(),
+            total_files,
             threads_used: 0,
         });
     }
 
     // ============================================================================
-    // Prepare for Traversal (check for incremental update opportunity)
+    // Prepare for Traversal
     // ============================================================================
     
-    #[cfg(windows)]
-    let changed_dirs_filter = {
-        // Check if we have changed directories from USN Journal
-        if !cache.entries.is_empty() {
-            let mut tracker = USNTracker::new(scan_root.clone(), cache.usn_state.clone());
-            if tracker.needs_refresh() {
-                if let Ok((changed_dirs, wrap_detected, new_state)) = tracker.refresh() {
-                    cache.usn_state = new_state;
-                    if !wrap_detected && !changed_dirs.is_empty() {
-                        // Convert PathBuf changed_dirs to HashSet<String> for filtering
-                        Some(changed_dirs.iter()
-                            .filter_map(|p| p.to_str().map(|s| s.to_string()))
-                            .collect())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    };
-    
-    #[cfg(not(windows))]
+    // Note: Incremental filtering is now handled in main.rs via the --incremental flag
+    // This allows cleaner separation between incremental (USN Journal) and full scan (DFS)
     let changed_dirs_filter: Option<std::collections::HashSet<String>> = None;
 
     // ============================================================================
@@ -248,13 +211,16 @@ pub fn traverse_disk(drive: &char, cache: &mut DiskCache, args: &Args) -> Result
     // Extract & Save Final Cache
     // ============================================================================
 
-    let final_cache = match Arc::try_unwrap(state.cache) {
+    let mut final_cache = match Arc::try_unwrap(state.cache) {
         Ok(lock) => lock.into_inner(),
         Err(arc) => {
             let guard = arc.read();
             guard.clone()
         }
     };
+
+    // Flush any remaining pending writes before saving
+    final_cache.flush_pending_writes();
 
     let cache_index_start = Instant::now();
     
@@ -271,9 +237,16 @@ pub fn traverse_disk(drive: &char, cache: &mut DiskCache, args: &Args) -> Result
     };
     cache.skip_stats = skip_stats;
 
-    let cache_path = crate::cache::get_cache_path()?;
+    let cache_path = if let Some(ref custom_dir) = args.cache_dir {
+        crate::cache::get_cache_path_custom(Some(custom_dir))?
+    } else {
+        crate::cache::get_cache_path()?
+    };
+    
     let save_start = Instant::now();
-    cache.save(&cache_path)?;
+    if !args.no_cache {
+        cache.save(&cache_path)?;
+    }
     let save_elapsed = save_start.elapsed();
     
     let cache_index_elapsed = cache_index_start.elapsed();
@@ -282,6 +255,8 @@ pub fn traverse_disk(drive: &char, cache: &mut DiskCache, args: &Args) -> Result
     // Return Debug Info
     // ============================================================================
 
+    let total_files = cache.entries.values().map(|e| e.children.len()).sum();
+    
     Ok(DebugInfo {
         is_first_run,
         scan_root: cache.root.clone(),
@@ -290,6 +265,7 @@ pub fn traverse_disk(drive: &char, cache: &mut DiskCache, args: &Args) -> Result
         save_time: save_elapsed,
         cache_index_time: cache_index_elapsed,
         total_dirs: cache.entries.len(),
+        total_files,
         threads_used: num_threads,
     })
 }
@@ -360,7 +336,8 @@ fn dfs_worker(
                     if let Ok(entries) = fs::read_dir(&path) {
                          let mut children = Vec::new();
                          let mut child_entries = Vec::new();
-                         let mut child_dirs = Vec::new();
+                         let mut child_dirs_to_queue = Vec::new();
+                         let mut child_files_to_cache = Vec::new();
                          let mut skipped = Vec::new(); // Batch skipped directories
 
                          for entry_result in entries {
@@ -375,34 +352,66 @@ fn dfs_worker(
                                       continue;
                                   }
 
-                                 let child_path = entry.path();
-                                 children.push(file_name_str.to_string());
+                                  let child_path = entry.path();
+                                  children.push(file_name_str.to_string());
 
-                                 // Check if this is a directory (avoid unnecessary metadata calls for files)
-                                 match entry.file_type() {
-                                     Ok(ft) if ft.is_symlink() => {
-                                         // Capture symlink target
-                                         let target = fs::read_link(&child_path).ok();
-                                         child_entries.push((file_name_str.to_string(), target));
-                                     }
-                                     Ok(ft) if ft.is_dir() => {
-                                         // Queue directories for processing (non-symlink)
-                                         child_dirs.push(child_path);
-                                     }
-                                     _ => {} // Not a directory, skip
-                                 }
-                             }
+                                  // Check if this is a directory (avoid unnecessary metadata calls for files)
+                                  match entry.file_type() {
+                                      Ok(ft) if ft.is_dir() => {
+                                          // Queue directories for processing
+                                          child_dirs_to_queue.push(child_path.clone());
+                                          // Also add to cache for file listing
+                                          if !child_files_to_cache.iter().any(|p| p == &child_path) {
+                                              child_files_to_cache.push(child_path);
+                                          }
+                                      }
+                                      Ok(ft) if ft.is_symlink() => {
+                                          // Capture symlink target - add to both queues if it's a dir symlink
+                                          let target = fs::read_link(&child_path).ok();
+                                          child_entries.push((file_name_str.to_string(), target));
+                                          child_files_to_cache.push(child_path.clone());
+                                          // Don't queue symlinks for traversal - they would cause loops
+                                      }
+                                      Ok(_) => {
+                                          // Regular file: add to cache but don't queue for traversal
+                                          child_files_to_cache.push(child_path);
+                                      }
+                                      _ => {} // Couldn't get file type, skip
+                                  }
+                              }
                          }
 
                          // ========================================================
                          // Batch queue directories (reduce lock contention)
                          // ========================================================
-                         if !child_dirs.is_empty() {
+                         if !child_dirs_to_queue.is_empty() {
                              let mut queue = work_queue.lock().unwrap();
-                             for dir_path in child_dirs {
+                             for dir_path in child_dirs_to_queue {
                                  queue.push_back(dir_path);
                              }
                          }
+                         
+                         // ========================================================
+                         // Batch cache file entries (for tree output)
+                         // ========================================================
+                         if !child_files_to_cache.is_empty() {
+                             let mut cache_guard = cache.write();
+                             for file_path in child_files_to_cache {
+                                 let file_entry = DirEntry {
+                                     path: file_path.clone(),
+                                     name: file_path
+                                         .file_name()
+                                         .and_then(|n| n.to_str().map(|s| s.to_string()))
+                                         .unwrap_or_default(),
+                                     modified: Utc::now(),
+                                     size: 0,
+                                     children: Vec::new(), // Files don't have children
+                                     symlink_target: None,
+                                     is_hidden: false,
+                                 };
+                                 cache_guard.add_entry(file_path, file_entry);
+                             }
+                         } // Lock released immediately
 
                          // ========================================================
                          // Batch flush skip statistics (reduce lock contention)

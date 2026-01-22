@@ -76,68 +76,47 @@ impl DiskCache {
     // ============================================================================
 
     /// Open or create cache file
-    /// 
-    /// Tries to load from mmap format first (faster), falls back to bincode format
-    pub fn open(path: &Path) -> Result<Self> {
-        fs::create_dir_all(path.parent().unwrap())?;
-
-        // Try mmap format first (.idx and .dat files)
-        let index_path = path.with_extension("idx");
-        let data_path = path.with_extension("dat");
-        
-        if index_path.exists() && data_path.exists() {
-            if let Ok(mmap_cache) = Self::load_from_mmap(&index_path, &data_path) {
-                return Ok(mmap_cache);
-            }
-        }
-
-        // Fall back to bincode format
-        if path.exists() {
-            let mut file = File::open(path)?;
-            let mut data = Vec::new();
-            file.read_to_end(&mut data)?;
-
-            // Try to deserialize as new format, fall back to old format if needed
-            let mut cache: DiskCache = match bincode::deserialize(&data) {
-                Ok(c) => c,
-                Err(_) => {
-                    // Likely old cache format without last_scanned_root or usn_state
-                    // Create fresh cache and delete old one to avoid future errors
-                    let _ = fs::remove_file(path);
-                    Self::new_empty()
-                }
-            };
-
-            cache.pending_writes = Vec::new();
-            cache.flush_threshold = 5000; // More frequent flushes to reduce lock contention
-            Ok(cache)
-        } else {
-            Ok(Self::new_empty())
-        }
-    }
+     /// 
+     /// Loads from rkyv mmap format (.idx and .dat files) for O(1) lazy loading
+     /// Index is memory-mapped and accessed via bitshift operations
+     pub fn open(path: &Path) -> Result<Self> {
+         fs::create_dir_all(path.parent().unwrap())?;
     
-    /// Load from mmap format (faster path for cached loads)
-    fn load_from_mmap(index_path: &Path, data_path: &Path) -> Result<Self> {
-        use crate::cache_mmap::MmapCache;
-        
-        let mmap_cache = MmapCache::open(index_path, data_path)?;
-        
-        // Convert mmap cache back to DiskCache by loading all entries
-        let entries = mmap_cache.get_all()?;
-        
-        Ok(DiskCache {
-            entries,
-            last_scan: mmap_cache.index.last_scan,
-            root: mmap_cache.index.root.clone(),
-            last_scanned_root: mmap_cache.index.last_scanned_root.clone(),
-            #[cfg(windows)]
-            usn_state: mmap_cache.index.usn_state.clone(),
-            pending_writes: Vec::new(),
-            flush_threshold: 5000,
-            show_hidden: false,
-            skip_stats: mmap_cache.index.skip_stats.clone(),
-        })
-    }
+         // Load from rkyv mmap format (.idx and .dat files)
+         let index_path = path.with_extension("idx");
+         let data_path = path.with_extension("dat");
+         
+         if index_path.exists() && data_path.exists() {
+             if let Ok(mmap_cache) = Self::load_from_rkyv_mmap(&index_path, &data_path) {
+                 return Ok(mmap_cache);
+             }
+         }
+    
+         Ok(Self::new_empty())
+     }
+     
+     /// Load from rkyv mmap format (O(1) lazy loading via mmap + bitshift index)
+     fn load_from_rkyv_mmap(index_path: &Path, data_path: &Path) -> Result<Self> {
+         use crate::cache_rkyv::RkyvMmapCache;
+         
+         let rkyv_cache = RkyvMmapCache::open(index_path, data_path)?;
+         
+         // Load all entries (converts from RkyvDirEntry to DiskCache DirEntry)
+         let entries = rkyv_cache.get_all()?;
+         
+         Ok(DiskCache {
+             entries,
+             last_scan: rkyv_cache.index.last_scan,
+             root: rkyv_cache.index.root.clone(),
+             last_scanned_root: rkyv_cache.index.last_scanned_root.clone(),
+             #[cfg(windows)]
+             usn_state: rkyv_cache.index.usn_state.clone(),
+             pending_writes: Vec::new(),
+             flush_threshold: 5000,
+             show_hidden: false,
+             skip_stats: rkyv_cache.index.skip_stats.clone(),
+         })
+     }
     
     /// Create a new empty cache with default USN state
     #[cfg(windows)]
@@ -170,74 +149,68 @@ impl DiskCache {
         }
     }
 
-    /// Save cache atomically using temp file + rename pattern
-    pub fn save(&mut self, path: &Path) -> Result<()> {
-        self.flush_pending_writes();
-
-        // Also save as mmap cache for faster loading next time
-        let mmap_index_path = path.with_extension("idx");
-        let mmap_data_path = path.with_extension("dat");
-        self.save_as_mmap(&mmap_index_path, &mmap_data_path)?;
-
-        let data = bincode::serialize(&self)?;
-        let temp_path = path.with_extension("tmp");
-
-        // Write to temporary file first
-        let mut file = File::create(&temp_path)?;
-        file.write_all(&data)?;
-        file.sync_all()?;
-
-        // Atomic rename (prevents corruption if crash occurs)
-        fs::rename(&temp_path, path)?;
-        Ok(())
-    }
+    /// Save cache using rkyv mmap format (index + data files with O(1) access)
+     pub fn save(&mut self, path: &Path) -> Result<()> {
+         self.flush_pending_writes();
     
-    /// Save cache in mmap format (index + data files)
-    fn save_as_mmap(&self, index_path: &Path, data_path: &Path) -> Result<()> {
-        use crate::cache_mmap::CacheIndex;
-        
-        fs::create_dir_all(index_path.parent().unwrap())?;
-        
-        // Build index with byte offsets
-        let mut offsets = std::collections::HashMap::new();
-        let mut data_file = File::create(data_path)?;
-        let mut current_offset = 0u64;
-        
-        for (path, entry) in &self.entries {
-            // Record offset before writing
-            offsets.insert(path.clone(), current_offset);
-            
-            // Serialize and write entry with length prefix
-            let serialized = bincode::serialize(entry)?;
-            let len = serialized.len() as u32;
-            
-            data_file.write_all(&len.to_le_bytes())?;
-            data_file.write_all(&serialized)?;
-            
-            current_offset += 4 + serialized.len() as u64;
-        }
-        data_file.sync_all()?;
-        
-        // Save index
-        let index = CacheIndex {
-            offsets,
-            last_scan: self.last_scan,
-            root: self.root.clone(),
-            last_scanned_root: self.last_scanned_root.clone(),
-            #[cfg(windows)]
-            usn_state: self.usn_state.clone(),
-            skip_stats: self.skip_stats.clone(),
-        };
-        
-        let index_data = bincode::serialize(&index)?;
-        let temp_path = index_path.with_extension("tmp");
-        let mut file = File::create(&temp_path)?;
-        file.write_all(&index_data)?;
-        file.sync_all()?;
-        fs::rename(&temp_path, index_path)?;
-        
-        Ok(())
-    }
+         let index_path = path.with_extension("idx");
+         let data_path = path.with_extension("dat");
+         
+         self.save_as_rkyv_mmap(&index_path, &data_path)?;
+         Ok(())
+     }
+     
+     /// Save cache in mmap format (index + data files with bincode serialization)
+     fn save_as_rkyv_mmap(&self, index_path: &Path, data_path: &Path) -> Result<()> {
+         use crate::cache_rkyv::{RkyvDirEntry, RkyvCacheIndex};
+         use std::io::Seek;
+         
+         fs::create_dir_all(index_path.parent().unwrap())?;
+         
+         // Build index with byte offsets
+         let mut rkyv_index = RkyvCacheIndex::new();
+         rkyv_index.root = self.root.clone();
+         rkyv_index.last_scanned_root = self.last_scanned_root.clone();
+         rkyv_index.last_scan = self.last_scan;
+         rkyv_index.skip_stats = self.skip_stats.clone();
+         #[cfg(windows)]
+         {
+             rkyv_index.usn_state = self.usn_state.clone();
+         }
+         
+         let mut data_file = File::create(data_path)?;
+         
+         for (path, entry) in &self.entries {
+             let rkyv_entry = RkyvDirEntry {
+                 path: entry.path.clone(),
+                 name: entry.name.clone(),
+                 modified: entry.modified,
+                 size: entry.size,
+                 children: entry.children.clone(),
+                 symlink_target: entry.symlink_target.clone(),
+                 is_hidden: entry.is_hidden,
+             };
+             
+             let serialized = bincode::serialize(&rkyv_entry)?;
+             let len = serialized.len() as u32;
+             let offset = data_file.stream_position()?;
+             
+             rkyv_index.offsets.insert(path.clone(), offset);
+             data_file.write_all(&len.to_le_bytes())?;
+             data_file.write_all(&serialized)?;
+         }
+         data_file.sync_all()?;
+         
+         // Save index
+         let index_serialized = bincode::serialize(&rkyv_index)?;
+         let temp_path = index_path.with_extension("tmp");
+         let mut index_file = File::create(&temp_path)?;
+         index_file.write_all(&index_serialized)?;
+         index_file.sync_all()?;
+         fs::rename(&temp_path, index_path)?;
+         
+         Ok(())
+     }
 
     // ============================================================================
     // Entry Management

@@ -1,8 +1,9 @@
 mod cache;
-mod cache_mmap;
+mod cache_rkyv;
 mod traversal;
 mod error;
 mod cli;
+mod scheduler;
 
 #[cfg(windows)]
 mod usn_journal;
@@ -12,38 +13,57 @@ use cli::{OutputFormat, ColorMode};
 use std::time::Instant;
 
 fn main() -> Result<()> {
-    let program_start = Instant::now();
-
-    // ========================================================================
-    // Parse Command-Line Arguments
-    // ========================================================================
-
-    let args = cli::parse_args();
-
-    // ========================================================================
-    // Determine Color Output Settings
-    // ========================================================================
-
-    let use_colors = match args.color {
-        ColorMode::Auto => atty::is(atty::Stream::Stdout),
-        ColorMode::Always => true,
-        ColorMode::Never => false,
-    };
-
-    // ========================================================================
-    // Load or Create Cache
-    // ========================================================================
-
-    let cache_path = cache::get_cache_path()?;
-    let cache_load_start = Instant::now();
-    let mut cache = cache::DiskCache::open(&cache_path)?;
-    let cache_load_elapsed = cache_load_start.elapsed();
-
-    // ========================================================================
-    // Traverse Disk & Update Cache
-    // ========================================================================
-
-    let debug_info = traversal::traverse_disk(&args.drive, &mut cache, &args)?;
+     let program_start = Instant::now();
+ 
+     // ========================================================================
+     // Parse Command-Line Arguments
+     // ========================================================================
+ 
+     let args = cli::parse_args();
+ 
+     // ========================================================================
+     // Handle Scheduler Commands (Early Exit)
+     // ========================================================================
+ 
+     if args.scheduler {
+         scheduler::install_scheduler()?;
+         return Ok(());
+     }
+ 
+     if args.scheduler_uninstall {
+         scheduler::uninstall_scheduler()?;
+         return Ok(());
+     }
+ 
+     if args.scheduler_status {
+         scheduler::check_scheduler_status()?;
+         return Ok(());
+     }
+ 
+     // ========================================================================
+     // Determine Color Output Settings
+     // ========================================================================
+ 
+     let use_colors = match args.color {
+         ColorMode::Auto => atty::is(atty::Stream::Stdout),
+         ColorMode::Always => true,
+         ColorMode::Never => false,
+     };
+ 
+     // ========================================================================
+     // Load or Create Cache
+     // ========================================================================
+ 
+     let cache_path = cache::get_cache_path()?;
+     let cache_load_start = Instant::now();
+     let mut cache = cache::DiskCache::open(&cache_path)?;
+     let cache_load_elapsed = cache_load_start.elapsed();
+ 
+     // ========================================================================
+     // Traverse Disk & Update Cache
+     // ========================================================================
+ 
+     let debug_info = traversal::traverse_disk(&args.drive, &mut cache, &args)?;
 
     // ========================================================================
     // Output Results

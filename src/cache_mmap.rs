@@ -8,7 +8,7 @@ use anyhow::{Result, anyhow};
 use memmap2::Mmap;
 
 #[cfg(windows)]
-use crate::usn_journal::USNJournalState;
+use ptree_driver::USNJournalState;
 
 use crate::cache::DirEntry;
 

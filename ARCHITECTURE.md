@@ -262,6 +262,42 @@ Planned approach:
 | Cache miss (rescan) | 5-10 min | Disk I/O |
 | Tree output | 1-2 sec | String formatting |
 
+## Performance Optimizations
+
+### Optimized Lazy-Loading (Implemented)
+
+**Goal**: O(1) single-node access without loading entire cache into memory
+
+**Architecture**:
+- **Index file** (.idx): Bincode-serialized HashMap<PathBuf, u64> mapping paths to byte offsets
+  - Fully deserialized on load (typically <1MB even for millions of entries)
+  - Enables instant O(1) lookups via HashMap
+  
+- **Data file** (.dat): Length-prefixed serialized DirEntry objects
+  - Stored sequentially with format: [4-byte length][bincode-serialized entry]
+  - Memory-mapped for large files without allocation
+  - Entries only deserialized on access (lazy loading)
+
+**Benefits**:
+- Single-node access is O(1): lookup offset in index HashMap, deserialize from mmap
+- No memory overhead for unaccessed entries
+- Maintains full bincode compatibility for fallback
+- Scales to billion-entry caches without memory explosion
+
+**Implementation**: `cache_opt.rs` with `OptimizedCache` struct
+
+### Batch Optimization (Future)
+
+**Goal**: Vectorized offset computation and parallel child expansion
+
+**Approach**:
+- When expanding many children at once, compute child path offsets using SIMD bit-shifting
+- Batch child lookups via `get_batch()` API
+- Prepare for future packed_simd / wasm_simd implementation
+- Key use case: tree output generation with depth limits (many siblings at same level)
+
+**Placeholder**: `cache_opt.rs::OptimizedCache::get_batch()` method ready for SIMD backend
+
 ## Future Enhancements
 
 1. **Incremental updates**: Fast merges instead of full rescan
@@ -272,6 +308,7 @@ Planned approach:
 6. **Diff output**: Show what changed since last scan
 7. **Export formats**: JSON, CSV for analysis
 8. **Compression**: gzip cache for large disks
+9. **SIMD batch expansion**: Vectorized offset/name computation for large child sets
 
 ## File Structure
 
