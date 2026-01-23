@@ -334,7 +334,17 @@ impl DiskCache {
         
         for path in paths {
             if !self.entries.contains_key(path) {
-                if let Some(entry) = rkyv_cache.get_entry(path)? {
+                if let Some(rkyv_entry) = rkyv_cache.get_entry(path)? {
+                    let entry = DirEntry {
+                        path: rkyv_entry.path,
+                        name: rkyv_entry.name,
+                        modified: rkyv_entry.modified,
+                        content_hash: rkyv_entry.content_hash,
+                        children: rkyv_entry.children,
+                        symlink_target: rkyv_entry.symlink_target,
+                        is_hidden: rkyv_entry.is_hidden,
+                        is_dir: rkyv_entry.is_dir,
+                    };
                     self.entries.insert(path.clone(), entry);
                 }
             }

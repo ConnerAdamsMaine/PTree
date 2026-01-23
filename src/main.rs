@@ -1,75 +1,78 @@
-mod cache;
-mod cache_rkyv;
-mod traversal;
-mod error;
-mod cli;
-mod scheduler;
-
-#[cfg(windows)]
-mod usn_journal;
-
 use anyhow::Result;
-use cli::{OutputFormat, ColorMode};
+use ptree_core::{OutputFormat, ColorMode};
+use ptree_cache::DiskCache;
+use ptree_traversal::traverse_disk;
 use std::time::Instant;
 
+#[cfg(feature = "scheduler")]
+use ptree_scheduler as scheduler;
+
+#[cfg(feature = "incremental")]
+use ptree_incremental as incremental;
+
 fn main() -> Result<()> {
-     let program_start = Instant::now();
- 
-     // ========================================================================
-     // Parse Command-Line Arguments
-     // ========================================================================
- 
-     let args = cli::parse_args();
- 
-     // ========================================================================
-     // Handle Scheduler Commands (Early Exit)
-     // ========================================================================
- 
-     if args.scheduler {
-         scheduler::install_scheduler()?;
-         return Ok(());
-     }
- 
-     if args.scheduler_uninstall {
-         scheduler::uninstall_scheduler()?;
-         return Ok(());
-     }
- 
-     if args.scheduler_status {
-         scheduler::check_scheduler_status()?;
-         return Ok(());
-     }
- 
-     // ========================================================================
-     // Determine Color Output Settings
-     // ========================================================================
- 
-     let use_colors = match args.color {
-         ColorMode::Auto => atty::is(atty::Stream::Stdout),
-         ColorMode::Always => true,
-         ColorMode::Never => false,
-     };
- 
-     // ========================================================================
-     // Load or Create Cache
-     // ========================================================================
- 
-     let cache_path = cache::get_cache_path()?;
-     let cache_load_start = Instant::now();
-     let mut cache = cache::DiskCache::open(&cache_path)?;
-     let cache_load_elapsed = cache_load_start.elapsed();
- 
-     // ========================================================================
-     // Traverse Disk & Update Cache
-     // ========================================================================
- 
-     let debug_info = traversal::traverse_disk(&args.drive, &mut cache, &args)?;
+    let program_start = Instant::now();
+
+    let args = ptree_core::parse_args();
 
     // ========================================================================
-    // Output Results
+    // Handle Scheduler Commands (Early Exit)
+    // ========================================================================
+
+    #[cfg(feature = "scheduler")]
+    {
+        if args.scheduler {
+            scheduler::install_scheduler()?;
+            return Ok(());
+        }
+
+        if args.scheduler_uninstall {
+            scheduler::uninstall_scheduler()?;
+            return Ok(());
+        }
+
+        if args.scheduler_status {
+            scheduler::check_scheduler_status()?;
+            return Ok(());
+        }
+    }
+
+    // ========================================================================
+    // Determine Color Output Settings
+    // ========================================================================
+
+    let use_colors = match args.color {
+        ColorMode::Auto => atty::is(atty::Stream::Stdout),
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+    };
+
+    // ========================================================================
+    // Load or Create Cache
+    // ========================================================================
+
+    let cache_path = ptree_cache::get_cache_path()?;
+    let cache_load_start = Instant::now();
+    let mut cache = DiskCache::open(&cache_path)?;
+    let cache_load_elapsed = cache_load_start.elapsed();
+
+    // ========================================================================
+    // Traverse Disk & Update Cache
+    // ========================================================================
+
+    let debug_info = traverse_disk(&args.drive, &mut cache, &args)?;
+
+    // ========================================================================
+    // Output Results (with lazy-loading for cold-start)
     // ========================================================================
 
     cache.show_hidden = args.hidden;
+    
+    let lazy_load_start = Instant::now();
+    if cache.entries.is_empty() {
+        let _ = cache.load_all_entries_lazy(&cache_path);
+    }
+    let lazy_load_elapsed = lazy_load_start.elapsed();
 
     let formatting_start = Instant::now();
     let output = if !args.quiet {
@@ -103,10 +106,10 @@ fn main() -> Result<()> {
     }
 
     // ========================================================================
-    // Debug Output (Final Summary)
+    // Statistics Output (Final Summary)
     // ========================================================================
 
-    if args.debug {
+    if args.stats {
         let total_elapsed = program_start.elapsed();
         print_debug_summary(&debug_info, cache_load_elapsed, formatting_elapsed, output_elapsed, &cache_path, total_elapsed);
     }
@@ -123,7 +126,7 @@ fn format_duration(duration: std::time::Duration) -> String {
 
 /// Print formatted debug summary
 fn print_debug_summary(
-    debug_info: &traversal::DebugInfo,
+    debug_info: &ptree_traversal::DebugInfo,
     cache_load_time: std::time::Duration,
     formatting_time: std::time::Duration,
     output_time: std::time::Duration,
@@ -138,6 +141,7 @@ fn print_debug_summary(
     eprintln!("{:<40} {}", "Scan Root:", debug_info.scan_root.display());
 
     eprintln!("\n{:<40} {}", "Directories Scanned:", format_number(debug_info.total_dirs));
+    eprintln!("{:<40} {}", "Files Scanned:", format_number(debug_info.total_files));
     eprintln!("{:<40} {}", "Threads Used:", debug_info.threads_used);
 
     eprintln!("\n{:<40} {}", "Cache Load Time:", format_duration(cache_load_time));

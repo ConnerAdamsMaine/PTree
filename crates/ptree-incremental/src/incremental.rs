@@ -1,8 +1,7 @@
 // Incremental cache updates via USN Journal
 // Applies file system changes to the cache without full rescans
 
-#[cfg(windows)]
-use crate::cache::DiskCache;
+use ptree_cache::DiskCache;
 use anyhow::Result;
 
 /// Attempt incremental cache update using USN Journal

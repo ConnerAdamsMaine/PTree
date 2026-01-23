@@ -1,0 +1,8 @@
+[package]
+name = "ptree-incremental"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ptree-cache = { path = "../ptree-cache" }
+anyhow = "1.0"

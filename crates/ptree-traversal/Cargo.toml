@@ -1,0 +1,17 @@
+[package]
+name = "ptree-traversal"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ptree-core = { path = "../ptree-core" }
+ptree-cache = { path = "../ptree-cache" }
+anyhow = "1.0"
+chrono = "0.4"
+parking_lot = "0.12"
+rayon = "1.8"
+num_cpus = "1.16"
+
+[features]
+default = ["std"]
+std = []
